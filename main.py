@@ -9,6 +9,7 @@ from functools import partial
 import tools
 import logging
 from anyio import sleep, create_task_group, run
+from tkinter import messagebox
 
 MAX_RECONNECT_ATTEMPTS = 3
 
@@ -24,7 +25,7 @@ async def write_down_account_info(account_info):
         await file.write(account_info)
 
 
-async def register(reader, writer, sending_queue, messages_queue):
+async def register(reader, writer, sending_queue, messages_queue, status_updates_queue):
 
     messages_queue.put_nowait('Введите ник, который бы хотели использовать')
     username = await sending_queue.get()
@@ -36,6 +37,7 @@ async def register(reader, writer, sending_queue, messages_queue):
     logging.debug(response_decoded)
     await write_down_account_info(response_decoded)
 
+    tools.set_username(username, status_updates_queue)
     messages_queue.put_nowait(f'Добро пожаловать, {username}!')
     messages_queue.put_nowait('Ваша информация об аккаунте была записана в account.txt!')
 
@@ -44,7 +46,7 @@ async def register(reader, writer, sending_queue, messages_queue):
     await reader.readline()
 
 
-async def login(reader, writer, hash, sending_queue, messages_queue):
+async def login(reader, writer, hash, sending_queue, messages_queue, status_updates_queue):
 
     writer.write(f'{hash}\n'.encode())
     await writer.drain()
@@ -54,8 +56,8 @@ async def login(reader, writer, hash, sending_queue, messages_queue):
     logging.debug(response_decoded)
 
     if 'null' in response_decoded:
-        messages_queue.put_nowait(f'Неверный хеш!')
-        await register(reader, writer, sending_queue, messages_queue)
+        messagebox.showinfo('Неверный хеш!', 'Неверный хеш, дружище, отправляй ник!')
+        await register(reader, writer, sending_queue, messages_queue, status_updates_queue)
         return
 
     writer.write(f'\n'.encode())
@@ -63,10 +65,11 @@ async def login(reader, writer, hash, sending_queue, messages_queue):
     await reader.readline()
 
     username = json.loads(response_decoded)['nickname']
+    tools.set_username(username, status_updates_queue)
     messages_queue.put_nowait(f'Добро пожаловать, {username}!')
 
 
-async def authorize(reader, writer, sending_queue, messages_queue):
+async def authorize(reader, writer, sending_queue, messages_queue, status_updates_queue):
 
     response = await reader.readline()
     response_decoded = response.decode()
@@ -78,11 +81,10 @@ async def authorize(reader, writer, sending_queue, messages_queue):
         message = await sending_queue.get()
 
         if 'нет' == message.lower():
-
-            await register(reader, writer, sending_queue, messages_queue)
+            await register(reader, writer, sending_queue, messages_queue, status_updates_queue)
             break
         else:
-            await login(reader, writer, message, sending_queue, messages_queue)
+            await login(reader, writer, message, sending_queue, messages_queue, status_updates_queue)
             break
 
 
@@ -132,26 +134,15 @@ async def read_chat(open_reader_socket_function, messages_queue):
                 await asyncio.sleep(1)
 
 
-async def connect_endlessly(read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function):
-    attempts = 0
+async def connect_endlessly(status_updates_queue, read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function):
 
     await save_message('Установлено соединение!\n')
-    while True:
 
-        try:
-            async with create_task_group() as task_group:
-                task_group.start_soon(read_chat_function, open_reader_socket_function)
-                task_group.start_soon(write_in_chat_function, open_writer_socket_function, authorize_function)
+    status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
 
-        except ConnectionError:
-            await save_message('Соединение нарушено!')
-            if attempts < MAX_RECONNECT_ATTEMPTS:
-                await save_message('Попытка восстановить соединение...')
-                time.sleep(15)
-                attempts += 1
-            else:
-                await save_message('Невозможно установить соединение!')
-                raise RuntimeError('Невозможно установить соединение')
+    async with create_task_group() as task_group:
+        task_group.start_soon(read_chat_function, open_reader_socket_function)
+        task_group.start_soon(write_in_chat_function, open_writer_socket_function, authorize_function)
 
 
 async def main(args):
@@ -162,9 +153,9 @@ async def main(args):
 
     read_chat_function = partial(read_chat, messages_queue=messages_queue)
     write_in_chat_function = partial(write_in_chat, sending_queue=sending_queue)
-    authorize_function = partial(authorize, sending_queue=sending_queue, messages_queue=messages_queue)
-    open_reader_socket_function = partial(tools.open_reader_socket, host=args.host, port=args.reading_port)
-    open_writer_socket_function = partial(tools.open_writer_socket, host=args.host, port=args.writing_port)
+    authorize_function = partial(authorize, sending_queue=sending_queue, messages_queue=messages_queue, status_updates_queue=status_updates_queue)
+    open_reader_socket_function = partial(tools.open_reader_socket, host=args.host, port=args.reading_port, status_updates_queue=status_updates_queue, messages_queue=messages_queue)
+    open_writer_socket_function = partial(tools.open_writer_socket, host=args.host, port=args.writing_port, status_updates_queue=status_updates_queue, messages_queue=messages_queue)
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -173,7 +164,7 @@ async def main(args):
 
     await asyncio.gather(
         gui.draw(messages_queue, sending_queue, status_updates_queue),
-        connect_endlessly(read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function)
+        connect_endlessly(status_updates_queue, read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function)
     )
 
 if __name__ == '__main__':
