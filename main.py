@@ -11,7 +11,6 @@ import logging
 from anyio import sleep, create_task_group, run
 
 MAX_RECONNECT_ATTEMPTS = 3
-_authorized = False
 
 
 async def save_message(text):
@@ -27,15 +26,8 @@ async def write_down_account_info(account_info):
 
 async def register(reader, writer, sending_queue, messages_queue):
 
-    writer.write('\n'.encode())
-    await writer.drain()
-    response = await reader.readline()
-    logging.debug(response.decode())
-
     messages_queue.put_nowait('Введите ник, который бы хотели использовать')
-    while True:
-        username = await sending_queue.get()
-        break
+    username = await sending_queue.get()
     writer.write(f'{username}\n'.encode())
     await writer.drain()
 
@@ -44,8 +36,6 @@ async def register(reader, writer, sending_queue, messages_queue):
     logging.debug(response_decoded)
     await write_down_account_info(response_decoded)
 
-    username = json.loads(response_decoded)["nickname"]
-
     messages_queue.put_nowait(f'Добро пожаловать, {username}!')
     messages_queue.put_nowait('Ваша информация об аккаунте была записана в account.txt!')
 
@@ -53,21 +43,47 @@ async def register(reader, writer, sending_queue, messages_queue):
     await writer.drain()
     await reader.readline()
 
-    return username
+
+async def login(reader, writer, hash, sending_queue, messages_queue):
+
+    writer.write(f'{hash}\n'.encode())
+    await writer.drain()
+    response = await reader.readline()
+    response_decoded = response.decode()
+
+    logging.debug(response_decoded)
+
+    if 'null' in response_decoded:
+        messages_queue.put_nowait(f'Неверный хеш!')
+        await register(reader, writer, sending_queue, messages_queue)
+        return
+
+    writer.write(f'\n'.encode())
+    await writer.drain()
+    await reader.readline()
+
+    username = json.loads(response_decoded)['nickname']
+    messages_queue.put_nowait(f'Добро пожаловать, {username}!')
 
 
-async def authorize(reader, writer, sending_queue, messages_queue, hash):
+async def authorize(reader, writer, sending_queue, messages_queue):
 
     response = await reader.readline()
     response_decoded = response.decode()
     logging.debug(response_decoded)
 
-        # if hash:
-        #     await login(reader, writer, hash)
-        # else:
-        #     await register(reader, writer)
+    messages_queue.put_nowait('Есть ли у вас хеш? Если да, то отправьте его, если нет - напишите неты')
 
-    await register(reader, writer, sending_queue, messages_queue)
+    while True:
+        message = await sending_queue.get()
+
+        if 'нет' == message.lower():
+
+            await register(reader, writer, sending_queue, messages_queue)
+            break
+        else:
+            await login(reader, writer, message, sending_queue, messages_queue)
+            break
 
 
 async def read_old_messages(messages_queue):
@@ -85,16 +101,13 @@ async def read_old_messages(messages_queue):
 
 async def write_in_chat(open_writer_socket_function, authorize_function, sending_queue):
 
-    global _authorized
-
     async with open_writer_socket_function() as streamers:
         reader, writer = streamers
 
-        while True:
+        await authorize_function(reader, writer)
+        tools.AUTHORIZED = True
 
-            if not tools.AUTHORIZED:
-                await authorize_function(reader, writer)
-                tools.AUTHORIZED = True
+        while True:
 
             message = await sending_queue.get()
             message = message.replace('\n', '')
@@ -106,16 +119,17 @@ async def write_in_chat(open_writer_socket_function, authorize_function, sending
 
 async def read_chat(open_reader_socket_function, messages_queue):
 
-    if not tools.AUTHORIZED:
+    async with open_reader_socket_function() as reader:
 
-        async with open_reader_socket_function() as reader:
-
-            while True:
+        while True:
+            if tools.AUTHORIZED:
                 data = await reader.readline()
-                if data:
-                    data_decoded = data.decode()
-                    messages_queue.put_nowait(f'[{datetime.now().strftime("%d.%m %H:%M")}] {data_decoded}')
-                    await save_message(f'{data_decoded}')
+                data_decoded = data.decode()
+                messages_queue.put_nowait(f'[{datetime.now().strftime("%d.%m %H:%M")}] {data_decoded}')
+                await save_message(f'{data_decoded}')
+
+            else:
+                await asyncio.sleep(1)
 
 
 async def connect_endlessly(read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function):
@@ -148,7 +162,7 @@ async def main(args):
 
     read_chat_function = partial(read_chat, messages_queue=messages_queue)
     write_in_chat_function = partial(write_in_chat, sending_queue=sending_queue)
-    authorize_function = partial(authorize, sending_queue=sending_queue, messages_queue=messages_queue, hash=args.hash)
+    authorize_function = partial(authorize, sending_queue=sending_queue, messages_queue=messages_queue)
     open_reader_socket_function = partial(tools.open_reader_socket, host=args.host, port=args.reading_port)
     open_writer_socket_function = partial(tools.open_writer_socket, host=args.host, port=args.writing_port)
 
@@ -168,7 +182,6 @@ if __name__ == '__main__':
     parser.add_argument('--host', help='указать хост', default='minechat.dvmn.org')
     parser.add_argument('--writing_port', type=int, help='указать порт для чтения сообщений из чата', default=5050)
     parser.add_argument('--reading_port', type=int, help='указать порт для отправки сообщений в чат', default=5000)
-    parser.add_argument('--hash', help='указать хеш')
     parser.add_argument('--debug', action='store_true', help='указать включен/выключен дебаг сообщений в окно')
     args = parser.parse_args()
 
