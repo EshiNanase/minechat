@@ -1,5 +1,6 @@
 import asyncio
 import json
+import socket
 import sys
 import gui
 import argparse
@@ -8,14 +9,13 @@ from datetime import datetime
 from functools import partial
 import tools
 import logging
-from anyio import create_task_group
+from anyio import create_task_group, ExceptionGroup
 from tkinter import messagebox
 from async_timeout import timeout
-from requests import ConnectionError as RequestsConnectionError
-import time
 
-WATCHDOG_TIMEOUT = 30
-MAX_RECONNECT_ATTEMPTS = 3
+WATCHDOG_TIMEOUT = 60
+MAX_RECONNECT_ATTEMPTS = 5
+CHECK_CONN_TIMEOUT = 30
 
 watchdog_logger = logging.getLogger('watchdog_logger')
 
@@ -81,13 +81,17 @@ async def authorize(reader, writer, sending_queue, messages_queue, status_update
     response_decoded = response.decode()
     logging.debug(response_decoded)
 
-    messages_queue.put_nowait('Есть ли у вас хеш? Если да, то отправьте его, если нет - напишите нет')
+    messages_queue.put_nowait('Добро пожаловать в чат майнкрафтера!')
+    messages_queue.put_nowait('Есть ли у вас хеш? Если да, то отправьте его, если нет - напишите "нет"')
     watchdog_queue.put_nowait('Prompt before auth')
 
     while True:
         message = await sending_queue.get()
 
         if 'нет' == message.lower():
+            writer.write(f'\n'.encode())
+            await writer.drain()
+            await reader.readline()
             await register(reader, writer, sending_queue, messages_queue, status_updates_queue)
             break
         else:
@@ -110,77 +114,46 @@ async def read_old_messages(messages_queue):
 
 
 async def write_in_chat(open_writer_socket_function, authorize_function, sending_queue, watchdog_queue, messages_queue, status_updates_queue):
-    attempts = 0
 
-    while True:
+    async with open_writer_socket_function() as streamers:
+        reader, writer = streamers
 
-        try:
+        while True:
 
-            async with open_writer_socket_function() as streamers:
-                reader, writer = streamers
+            if not tools.AUTHORIZED:
+                await authorize_function(reader, writer)
+                tools.AUTHORIZED = True
+                status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.ESTABLISHED)
 
-                if not tools.AUTHORIZED:
-                    await authorize_function(reader, writer)
-                    tools.AUTHORIZED = True
-                    status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.ESTABLISHED)
-
-                else:
-
-                    message = await sending_queue.get()
-                    message = message.replace('\n', '')
-                    writer.write(f'{message}\n\n'.encode())
-                    watchdog_queue.put_nowait('Message sent')
-                    await writer.drain()
-                    response = await reader.readline()
-                    logging.debug(response.decode())
-
-        except RequestsConnectionError:
-
-            status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.INITIATED)
-            messages_queue.put_nowait('Соединение нарушено!')
-            if attempts < MAX_RECONNECT_ATTEMPTS:
-                messages_queue.put_nowait('Попытка восстановить соединение...')
-                await asyncio.sleep(15)
-                attempts += 1
             else:
-                messages_queue.put_nowait('Невозможно установить соединение!')
-                messagebox.showerror('Ошибка!', 'Соединение с сервером нарушено!')
-                raise RuntimeError('Соединение с сервером нарушено!')
+
+                message = await sending_queue.get()
+                message = message.replace('\n', '')
+                writer.write(f'{message}\n\n'.encode())
+                watchdog_queue.put_nowait('Message sent')
+                await writer.drain()
+                response = await reader.readline()
+                logging.debug(response.decode())
 
 
 async def read_chat(open_reader_socket_function, messages_queue, status_updates_queue, watchdog_queue):
 
-    attempts = 0
     status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.ESTABLISHED)
 
-    while True:
+    async with open_reader_socket_function() as streamers:
+        reader = streamers[0]
 
-        try:
+        while True:
 
-            async with open_reader_socket_function() as reader:
+            if tools.AUTHORIZED:
+                data = await reader.readline()
+                data_decoded = data.decode()
+                watchdog_queue.put_nowait('New message in chat')
+                messages_queue.put_nowait(f'[{datetime.now().strftime("%d.%m %H:%M")}] {data_decoded}')
+                await save_message(f'{data_decoded}')
 
-                if tools.AUTHORIZED:
-                    data = await reader.readline()
-                    data_decoded = data.decode()
-                    watchdog_queue.put_nowait('New message in chat')
-                    messages_queue.put_nowait(f'[{datetime.now().strftime("%d.%m %H:%M")}] {data_decoded}')
-                    await save_message(f'{data_decoded}')
-
-                else:
-                    await asyncio.sleep(1)
-
-        except RequestsConnectionError:
-
-            status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
-            messages_queue.put_nowait('Соединение нарушено!')
-            if attempts < MAX_RECONNECT_ATTEMPTS:
-                messages_queue.put_nowait('Попытка восстановить соединение...')
-                await asyncio.sleep(15)
-                attempts += 1
             else:
-                messages_queue.put_nowait('Невозможно установить соединение!')
-                messagebox.showerror('Ошибка!', 'Соединение с сервером нарушено!')
-                raise RuntimeError('Соединение с сервером нарушено!')
+                await asyncio.sleep(1)
 
 
 async def watch_for_connection(watchdog_queue):
@@ -196,11 +169,46 @@ async def watch_for_connection(watchdog_queue):
                     raise ConnectionError
 
 
-async def handle_connection(watch_for_connection_function, read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function):
+async def check_the_connection(open_writer_socket_function, messages_queue, status_updates_queue):
+
+    attempts = 0
+    while True:
+        async with timeout(CHECK_CONN_TIMEOUT) as time_out:
+            try:
+                async with open_writer_socket_function() as streamers:
+
+                    status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.ESTABLISHED)
+                    status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.ESTABLISHED)
+
+                    reader, writer = streamers
+                    writer.write('\n\n'.encode())
+                    await writer.drain()
+                    await reader.readline()
+                    await asyncio.sleep(1)
+
+            except (socket.gaierror, OSError, ExceptionGroup):
+                status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.INITIATED)
+                status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
+                messages_queue.put_nowait('Соединение нарушено!')
+                if attempts < MAX_RECONNECT_ATTEMPTS:
+                    messages_queue.put_nowait('Попытка восстановить соединение...')
+                    await asyncio.sleep(5)
+                    attempts += 1
+                else:
+                    messages_queue.put_nowait('Невозможно установить соединение!')
+                    messagebox.showerror('Ошибка!', 'Соединение с сервером нарушено!')
+                    raise RuntimeError('Соединение с сервером нарушено!')
+            finally:
+                if time_out.expired:
+                    raise ConnectionError
+
+
+async def handle_connection(check_the_connection_function, watch_for_connection_function, read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function):
 
     await save_message('Установлено соединение!\n')
 
     async with create_task_group() as task_group:
+        task_group.start_soon(check_the_connection_function, open_writer_socket_function)
         task_group.start_soon(read_chat_function, open_reader_socket_function)
         task_group.start_soon(write_in_chat_function, open_writer_socket_function, authorize_function)
         task_group.start_soon(watch_for_connection_function)
@@ -216,9 +224,10 @@ async def main(args):
     read_chat_function = partial(read_chat, messages_queue=messages_queue, watchdog_queue=watchdog_queue, status_updates_queue=status_updates_queue)
     write_in_chat_function = partial(write_in_chat, messages_queue=messages_queue, sending_queue=sending_queue, watchdog_queue=watchdog_queue, status_updates_queue=status_updates_queue)
     authorize_function = partial(authorize, sending_queue=sending_queue, messages_queue=messages_queue, status_updates_queue=status_updates_queue, watchdog_queue=watchdog_queue)
-    open_reader_socket_function = partial(tools.open_reader_socket, host=args.host, port=args.reading_port)
-    open_writer_socket_function = partial(tools.open_writer_socket, host=args.host, port=args.writing_port)
+    open_reader_socket_function = partial(tools.open_socket, host=args.host, port=args.reading_port)
+    open_writer_socket_function = partial(tools.open_socket, host=args.host, port=args.writing_port)
     watch_for_connection_function = partial(watch_for_connection, watchdog_queue=watchdog_queue)
+    check_the_connection_function = partial(check_the_connection, messages_queue=messages_queue, status_updates_queue=status_updates_queue)
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -226,10 +235,10 @@ async def main(args):
 
     await read_old_messages(messages_queue)
 
-    await asyncio.gather(
-        gui.draw(messages_queue, sending_queue, status_updates_queue),
-        handle_connection(watch_for_connection_function, read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function)
-    )
+    async with create_task_group() as task_group:
+        task_group.start_soon(gui.draw, messages_queue, sending_queue, status_updates_queue),
+        task_group.start_soon(handle_connection, check_the_connection_function, watch_for_connection_function, read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function),
+
 
 if __name__ == '__main__':
 
@@ -237,10 +246,12 @@ if __name__ == '__main__':
     parser.add_argument('--host', help='указать хост', default='minechat.dvmn.org')
     parser.add_argument('--writing_port', type=int, help='указать порт для чтения сообщений из чата', default=5050)
     parser.add_argument('--reading_port', type=int, help='указать порт для отправки сообщений в чат', default=5000)
-    parser.add_argument('--debug', action='store_true', help='указать включен/выключен дебаг сообщений в окно')
+    parser.add_argument('--debug', action='store_true', help='указать включен/выключен дебаг сообщений в терминал')
     args = parser.parse_args()
 
     try:
         asyncio.run(main(args))
     except KeyboardInterrupt:
         sys.stderr.write("Чат завершен\n")
+    except gui.TkAppClosed:
+        sys.stderr.write("Вы вышли из чата\n")
