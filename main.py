@@ -47,7 +47,7 @@ async def register(reader, writer, sending_queue, messages_queue, status_updates
     messages_queue.put_nowait(f'Добро пожаловать, {username}!')
     messages_queue.put_nowait('Ваша информация об аккаунте была записана в account.txt!')
 
-    writer.write(f'\n'.encode())
+    writer.write('\n'.encode())
     await writer.drain()
     await reader.readline()
 
@@ -66,7 +66,7 @@ async def login(reader, writer, hash, sending_queue, messages_queue, status_upda
         await register(reader, writer, sending_queue, messages_queue, status_updates_queue)
         return
 
-    writer.write(f'\n'.encode())
+    writer.write('\n'.encode())
     await writer.drain()
     await reader.readline()
 
@@ -89,7 +89,7 @@ async def authorize(reader, writer, sending_queue, messages_queue, status_update
         message = await sending_queue.get()
 
         if 'нет' == message.lower():
-            writer.write(f'\n'.encode())
+            writer.write('\n'.encode())
             await writer.drain()
             await reader.readline()
             await register(reader, writer, sending_queue, messages_queue, status_updates_queue)
@@ -113,7 +113,11 @@ async def read_old_messages(messages_queue):
         pass
 
 
-async def write_in_chat(open_writer_socket_function, authorize_function, sending_queue, watchdog_queue, messages_queue, status_updates_queue):
+async def write_in_chat(open_writer_socket_function,
+                        authorize_function,
+                        sending_queue,
+                        watchdog_queue,
+                        status_updates_queue):
 
     async with open_writer_socket_function() as streamers:
         reader, writer = streamers
@@ -203,7 +207,13 @@ async def check_the_connection(open_writer_socket_function, messages_queue, stat
                     raise ConnectionError
 
 
-async def handle_connection(check_the_connection_function, watch_for_connection_function, read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function):
+async def handle_connection(check_the_connection_function,
+                            watch_for_connection_function,
+                            read_chat_function,
+                            write_in_chat_function,
+                            authorize_function,
+                            open_reader_socket_function,
+                            open_writer_socket_function):
 
     await save_message('Установлено соединение!\n')
 
@@ -221,13 +231,44 @@ async def main(args):
     status_updates_queue = asyncio.Queue()
     watchdog_queue = asyncio.Queue()
 
-    read_chat_function = partial(read_chat, messages_queue=messages_queue, watchdog_queue=watchdog_queue, status_updates_queue=status_updates_queue)
-    write_in_chat_function = partial(write_in_chat, messages_queue=messages_queue, sending_queue=sending_queue, watchdog_queue=watchdog_queue, status_updates_queue=status_updates_queue)
-    authorize_function = partial(authorize, sending_queue=sending_queue, messages_queue=messages_queue, status_updates_queue=status_updates_queue, watchdog_queue=watchdog_queue)
-    open_reader_socket_function = partial(tools.open_socket, host=args.host, port=args.reading_port)
-    open_writer_socket_function = partial(tools.open_socket, host=args.host, port=args.writing_port)
-    watch_for_connection_function = partial(watch_for_connection, watchdog_queue=watchdog_queue)
-    check_the_connection_function = partial(check_the_connection, messages_queue=messages_queue, status_updates_queue=status_updates_queue)
+    read_chat_function = partial(
+        read_chat,
+        messages_queue=messages_queue,
+        watchdog_queue=watchdog_queue,
+        status_updates_queue=status_updates_queue
+    )
+    write_in_chat_function = partial(
+        write_in_chat,
+        sending_queue=sending_queue,
+        watchdog_queue=watchdog_queue,
+        status_updates_queue=status_updates_queue
+    )
+    authorize_function = partial(
+        authorize,
+        sending_queue=sending_queue,
+        messages_queue=messages_queue,
+        status_updates_queue=status_updates_queue,
+        watchdog_queue=watchdog_queue
+    )
+    open_reader_socket_function = partial(
+        tools.open_socket,
+        host=args.host,
+        port=args.reading_port
+    )
+    open_writer_socket_function = partial(
+        tools.open_socket,
+        host=args.host,
+        port=args.writing_port
+    )
+    watch_for_connection_function = partial(
+        watch_for_connection,
+        watchdog_queue=watchdog_queue
+    )
+    check_the_connection_function = partial(
+        check_the_connection,
+        messages_queue=messages_queue,
+        status_updates_queue=status_updates_queue
+    )
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -236,8 +277,22 @@ async def main(args):
     await read_old_messages(messages_queue)
 
     async with create_task_group() as task_group:
-        task_group.start_soon(gui.draw, messages_queue, sending_queue, status_updates_queue),
-        task_group.start_soon(handle_connection, check_the_connection_function, watch_for_connection_function, read_chat_function, write_in_chat_function, authorize_function, open_reader_socket_function, open_writer_socket_function),
+
+        task_group.start_soon(
+            gui.draw,
+            messages_queue,
+            sending_queue,
+            status_updates_queue),
+
+        task_group.start_soon(
+            handle_connection,
+            check_the_connection_function,
+            watch_for_connection_function,
+            read_chat_function,
+            write_in_chat_function,
+            authorize_function,
+            open_reader_socket_function,
+            open_writer_socket_function),
 
 
 if __name__ == '__main__':
